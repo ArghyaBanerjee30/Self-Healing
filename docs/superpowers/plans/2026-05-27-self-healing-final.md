@@ -4,7 +4,7 @@
 
 **Goal:** Build a production self-healing system that detects failures, categorises them (code vs infra vs ambiguous), queries a Neo4j knowledge graph for context, dispatches specialist subagents to fix the issue, gates deployment on confidence score, and feeds every outcome back into the knowledge graph — with zero human involvement for routine failures.
 
-**Architecture:** A LogWatcher emits signals to a two-stage Categoriser. The Categoriser routes to a Supervisor Agent which uses a skill+rule approach: understand deeply first, create a TodoList, then dispatch subagents (Observer→Detective→Coder→Tester→Committer for code; Operator→Executor→Verifier for infra). The Tester makes the deployment decision deterministically from test change analysis — no LLM scoring. A Learner writes every outcome back to the per-tenant Neo4j knowledge graph. Tests fail → rollback immediately.
+**Architecture:** A LogWatcher emits signals to a two-stage Categoriser. The Categoriser routes to a Supervisor Agent which uses a skill+rule approach: understand deeply first, create a TodoList, then dispatch subagents (Observer→Detective→Coder→**Guardrail**→Tester→Committer for code; Operator→Executor→Verifier for infra). The Guardrail validates every LLM-generated fix through static analysis, security scanning, and semantic review before tests run. The Tester makes the deployment decision deterministically from test change analysis — no LLM scoring. A Learner writes every outcome back to the per-tenant Neo4j knowledge graph. Tests fail → rollback immediately.
 
 **Tech Stack:** Python 3.11+, Neo4j 5.x, sentence-transformers, Ollama llama3.1:8b, FastAPI (demo app), KIND (local K8s), PyGithub, Rich, PyYAML, pytest, SQLite (metadata), subprocess (language-agnostic test runner)
 
@@ -53,6 +53,7 @@ self-healing/
 │   │   ├── observer.py                 # extracts file+line from stack trace
 │   │   ├── detective.py                # queries KG, LLM root cause analysis
 │   │   ├── coder.py                    # writes fix using LLM + KG context
+│   │   ├── guardrail.py               # static analysis, security scan, LLM semantic review
 │   │   ├── tester.py                   # runs tests, LLM revises on failure
 │   │   └── committer.py               # git branch + commit + PR or direct push
 │   │
@@ -2471,9 +2472,397 @@ class CoderAgent:
             lineterm="",
         )
         return "\n".join(diff)
+
+    def run_revision(
+        self,
+        incident: Incident,
+        feedback: str,
+        specific_issue: str = None,
+    ) -> dict:
+        """
+        Called by Supervisor when Guardrail rejects the fix.
+        Sends the specific guardrail failure reason back to the LLM
+        so it can write a targeted revision.
+        """
+        if not incident.buggy_code:
+            return {"fix_written": False, "reason": "No original code to revise from"}
+
+        file_path = self._find_file(incident.signal)
+        revision_context = (
+            f"Your previous fix was rejected by the code review guardrail.\n"
+            f"Rejection reason: {feedback}\n"
+            f"Specific issue: {specific_issue or 'see reason above'}\n\n"
+            f"Rewrite the fix addressing this specific problem."
+        )
+        revised_code = self.llm.write_code_fix(
+            buggy_code=incident.buggy_code,
+            root_cause=revision_context,
+            error=incident.signal.error_message,
+            file_path=file_path,
+        )
+        if not revised_code or revised_code.strip() == incident.fixed_code.strip():
+            return {"fix_written": False, "reason": "LLM returned unchanged code on revision"}
+
+        previous_code = incident.fixed_code
+        incident.fixed_code = revised_code
+        incident.fix_patch = self._generate_diff(
+            previous_code, revised_code, file_path
+        )
+        return {
+            "fix_written": True,
+            "patch_lines": len(incident.fix_patch.split("\n")),
+            "revision": True,
+        }
 ```
 
-### Task 5.4: Tester — runs tests + makes deployment decision
+### Task 5.5: Guardrail Agent — three-layer code validation
+
+**Sits between Coder and Tester. Validates the fix before any test is run.**
+
+**Files:**
+- Create: `agents/code/guardrail.py`
+- Create: `tests/test_guardrail.py`
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+# tests/test_guardrail.py
+from unittest.mock import MagicMock, patch
+from core.signal import Signal, SignalSource
+from core.incident import Incident, IncidentCategory
+from agents.code.guardrail import GuardrailAgent, GuardrailResult
+
+
+def _make_incident(fixed_code: str) -> Incident:
+    signal = Signal(
+        source=SignalSource.LOG, service="payments",
+        error_type="TypeError",
+        error_message="'NoneType' object is not subscriptable",
+        stack_trace='File "demo_app/payments.py", line 18, in process_payment',
+        raw_text="ERROR", occurrence_count=4,
+    )
+    inc = Incident.from_signal("inc-001", signal, IncidentCategory.CODE)
+    inc.fixed_code = fixed_code
+    inc.root_cause_analysis = "ROOT_CAUSE: inventory can be None\nPATTERN: missing null check"
+    return inc
+
+
+def test_layer1_fails_on_syntax_error():
+    """Static analysis catches syntax error before LLM is even called."""
+    incident = _make_incident("def process_payment(order_id\n    pass")
+    agent = GuardrailAgent(llm=MagicMock())
+    result = agent.run(incident)
+    assert result.passed is False
+    assert result.layer == "static"
+    assert "syntax" in result.reason.lower()
+
+
+def test_layer2_hard_blocks_on_security_violation():
+    """Security scan catches shell=True — hard block, no retry."""
+    incident = _make_incident(
+        "import subprocess\n"
+        "def process_payment(order_id):\n"
+        "    subprocess.run(order_id, shell=True)\n"
+    )
+    agent = GuardrailAgent(llm=MagicMock())
+    result = agent.run(incident)
+    assert result.passed is False
+    assert result.layer == "security"
+    assert result.hard_block is True
+
+
+def test_layer2_hard_blocks_on_eval():
+    """Security scan catches eval() — hard block."""
+    incident = _make_incident(
+        "def process_payment(order_id):\n"
+        "    return eval(order_id)\n"
+    )
+    agent = GuardrailAgent(llm=MagicMock())
+    result = agent.run(incident)
+    assert result.passed is False
+    assert result.layer == "security"
+    assert result.hard_block is True
+
+
+def test_layer3_fails_on_bare_except_pass():
+    """Semantic review catches bare except: pass via LLM judge."""
+    bad_fix = (
+        "def process_payment(order_id):\n"
+        "    try:\n"
+        "        inventory = get_inventory(order_id)\n"
+        "        total = inventory['price'] * inventory['quantity']\n"
+        "        return {'status': 'ok', 'total': total}\n"
+        "    except:\n"
+        "        pass\n"
+    )
+    incident = _make_incident(bad_fix)
+    mock_llm = MagicMock()
+    mock_llm.chat.return_value = (
+        "VERDICT: FAIL\n"
+        "REASON: Fix uses bare except: pass which silently swallows all exceptions\n"
+        "SPECIFIC_ISSUE: bare except: pass on line 6"
+    )
+    agent = GuardrailAgent(llm=mock_llm)
+    result = agent.run(incident)
+    assert result.passed is False
+    assert result.layer == "semantic"
+    assert result.hard_block is False
+    assert "bare except" in result.reason.lower()
+
+
+def test_all_layers_pass_on_clean_fix():
+    """Good fix passes all three layers."""
+    good_fix = (
+        "def process_payment(order_id: str) -> dict:\n"
+        "    inventory = get_inventory(order_id)\n"
+        "    if inventory is None:\n"
+        "        raise ValueError(f'Inventory not found for order {order_id}')\n"
+        "    total = inventory['price'] * inventory['quantity']\n"
+        "    return {'status': 'ok', 'order_id': order_id, 'total': total}\n"
+    )
+    incident = _make_incident(good_fix)
+    mock_llm = MagicMock()
+    mock_llm.chat.return_value = (
+        "VERDICT: PASS\n"
+        "REASON: Fix correctly adds null guard and raises a descriptive ValueError\n"
+        "SPECIFIC_ISSUE: none"
+    )
+    agent = GuardrailAgent(llm=mock_llm)
+    result = agent.run(incident)
+    assert result.passed is True
+    assert result.layer == "all"
+    assert result.hard_block is False
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+```bash
+pytest tests/test_guardrail.py -v
+```
+
+Expected: FAIL — module not found
+
+- [ ] **Step 3: Implement GuardrailAgent**
+
+```python
+# agents/code/guardrail.py
+import ast
+import re
+import subprocess
+from dataclasses import dataclass
+from typing import Optional
+from core.incident import Incident
+from core.llm import OllamaClient
+
+
+# Layer 2: patterns that constitute a hard security block
+SECURITY_PATTERNS = [
+    (r"\beval\s*\(", "eval() detected — arbitrary code execution risk"),
+    (r"\bexec\s*\(", "exec() detected — arbitrary code execution risk"),
+    (r"shell\s*=\s*True", "shell=True in subprocess — command injection risk"),
+    (r"pickle\.loads?\s*\(", "pickle.loads() — unsafe deserialization risk"),
+    (r"__import__\s*\(", "__import__() — dynamic import risk"),
+    (r"os\.system\s*\(", "os.system() — command injection risk"),
+    (r"(?:password|secret|api_key|token)\s*=\s*['\"][^'\"]{8,}['\"]",
+     "Hardcoded credential detected"),
+]
+
+# Layer 3: LLM judge system prompt
+SEMANTIC_JUDGE_SYSTEM = """You are a senior code reviewer performing a safety review.
+You did NOT write this fix. Your job is to find problems with it.
+
+REJECT the fix if ANY of the following are true:
+- Uses bare except: pass or except: continue (silently swallows errors)
+- Returns a fake or default value instead of raising a proper exception
+- Does not address the stated root cause
+- Changes the function signature or return type
+- Introduces a new external library dependency
+- Is disproportionately large for a simple guard clause (30+ lines)
+- Contradicts standard error handling patterns
+
+Respond in EXACTLY this format (no other text):
+VERDICT: PASS or FAIL
+REASON: one sentence explaining your decision
+SPECIFIC_ISSUE: the exact problem if FAIL, or "none" if PASS"""
+
+
+@dataclass
+class GuardrailResult:
+    passed: bool
+    layer: str           # "static" | "security" | "semantic" | "all"
+    reason: str
+    specific_issue: Optional[str] = None
+    hard_block: bool = False
+
+
+class GuardrailAgent:
+    """
+    Three-layer code validation between Coder and Tester.
+
+    Layer 1 — Static Analysis:  syntax, imports, undefined vars (no LLM)
+    Layer 2 — Security Scan:    dangerous patterns (no LLM, hard block)
+    Layer 3 — Semantic Review:  LLM-as-judge (independent critic call)
+
+    Returns GuardrailResult. Supervisor sends failures back to Coder
+    except security violations which are always hard-blocked.
+    """
+
+    def __init__(self, llm: OllamaClient = None):
+        self.llm = llm or OllamaClient()
+
+    def run(self, incident: Incident) -> GuardrailResult:
+        code = incident.fixed_code or ""
+
+        # Layer 1: Static analysis
+        static_result = self._static_analysis(code)
+        if not static_result.passed:
+            return static_result
+
+        # Layer 2: Security scan
+        security_result = self._security_scan(code)
+        if not security_result.passed:
+            return security_result
+
+        # Layer 3: Semantic review
+        semantic_result = self._semantic_review(code, incident)
+        if not semantic_result.passed:
+            return semantic_result
+
+        return GuardrailResult(
+            passed=True,
+            layer="all",
+            reason="All three guardrail layers passed",
+            hard_block=False,
+        )
+
+    def _static_analysis(self, code: str) -> GuardrailResult:
+        """Layer 1: AST parse + basic lint check."""
+        # AST parse — catches syntax errors
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            return GuardrailResult(
+                passed=False,
+                layer="static",
+                reason=f"Syntax error in generated fix: {e.msg} at line {e.lineno}",
+                specific_issue=str(e),
+                hard_block=False,
+            )
+
+        # ruff check if available — catches undefined names, imports
+        try:
+            result = subprocess.run(
+                ["ruff", "check", "--select=F", "-"],
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0 and result.stdout.strip():
+                first_issue = result.stdout.strip().split("\n")[0]
+                return GuardrailResult(
+                    passed=False,
+                    layer="static",
+                    reason=f"Static analysis issue: {first_issue}",
+                    specific_issue=result.stdout.strip(),
+                    hard_block=False,
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # ruff not installed — skip, AST parse was sufficient
+
+        return GuardrailResult(
+            passed=True, layer="static",
+            reason="Static analysis passed", hard_block=False,
+        )
+
+    def _security_scan(self, code: str) -> GuardrailResult:
+        """
+        Layer 2: Pattern-based security scan.
+        Any match = HARD BLOCK. No retry. No exceptions.
+        """
+        for pattern, description in SECURITY_PATTERNS:
+            if re.search(pattern, code, re.IGNORECASE):
+                return GuardrailResult(
+                    passed=False,
+                    layer="security",
+                    reason=f"Security violation — hard block: {description}",
+                    specific_issue=description,
+                    hard_block=True,
+                )
+        return GuardrailResult(
+            passed=True, layer="security",
+            reason="Security scan passed", hard_block=False,
+        )
+
+    def _semantic_review(self, code: str, incident: Incident) -> GuardrailResult:
+        """
+        Layer 3: LLM-as-judge.
+        A separate, independent LLM call acting as critic.
+        """
+        prompt = (
+            f"Root cause of the bug:\n{incident.root_cause_analysis}\n\n"
+            f"Error that occurred:\n{incident.signal.error_message}\n\n"
+            f"Fix written by the coding agent:\n{code}\n\n"
+            "Review this fix."
+        )
+        raw = self.llm.chat(prompt, system=SEMANTIC_JUDGE_SYSTEM)
+
+        verdict = "PASS"
+        reason = "Semantic review passed"
+        specific_issue = None
+
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("VERDICT:"):
+                verdict = line.split(":", 1)[1].strip().upper()
+            elif line.startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+            elif line.startswith("SPECIFIC_ISSUE:"):
+                specific_issue = line.split(":", 1)[1].strip()
+                if specific_issue.lower() == "none":
+                    specific_issue = None
+
+        if verdict == "FAIL":
+            return GuardrailResult(
+                passed=False,
+                layer="semantic",
+                reason=reason,
+                specific_issue=specific_issue,
+                hard_block=False,
+            )
+
+        return GuardrailResult(
+            passed=True, layer="semantic",
+            reason=reason, hard_block=False,
+        )
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+pytest tests/test_guardrail.py -v
+```
+
+Expected:
+```
+PASSED tests/test_guardrail.py::test_layer1_fails_on_syntax_error
+PASSED tests/test_guardrail.py::test_layer2_hard_blocks_on_security_violation
+PASSED tests/test_guardrail.py::test_layer2_hard_blocks_on_eval
+PASSED tests/test_guardrail.py::test_layer3_fails_on_bare_except_pass
+PASSED tests/test_guardrail.py::test_all_layers_pass_on_clean_fix
+5 passed
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add agents/code/guardrail.py tests/test_guardrail.py
+git commit -m "feat: add Guardrail agent — static analysis, security scan, LLM semantic review"
+```
+
+---
+
+### Task 5.5: Tester — runs tests + makes deployment decision
 
 **The Tester owns the deployment decision. No LLM scoring. Pure deterministic rule.**
 
@@ -3579,6 +3968,7 @@ from agents.code.observer import ObserverAgent
 from agents.code.detective import DetectiveAgent
 from agents.code.coder import CoderAgent
 from agents.code.tester import TesterAgent
+from agents.code.guardrail import GuardrailAgent
 from agents.code.committer import CommitterAgent
 from agents.infra.operator import OperatorAgent
 from agents.infra.executor import ExecutorAgent
@@ -3611,6 +4001,7 @@ class SupervisorAgent:
         observer: ObserverAgent = None,
         detective: DetectiveAgent = None,
         coder: CoderAgent = None,
+        guardrail: GuardrailAgent = None,
         tester: TesterAgent = None,
         committer: CommitterAgent = None,
         operator: OperatorAgent = None,
@@ -3625,6 +4016,7 @@ class SupervisorAgent:
         self.observer = observer or ObserverAgent()
         self.detective = detective or DetectiveAgent()
         self.coder = coder or CoderAgent()
+        self.guardrail = guardrail or GuardrailAgent()
         self.tester = tester or TesterAgent(config=config)
         self.committer = committer or CommitterAgent()
         self.operator = operator or OperatorAgent()
@@ -3687,6 +4079,65 @@ class SupervisorAgent:
         todo_list.complete(2, f"{code_result['patch_lines']} lines changed")
         self.ui.agent_done("CODER", code_result)
         self.ui.show_diff(incident)
+
+        # ── GUARDRAIL ─────────────────────────────────────────────────
+        # Validate the fix before any test is run:
+        # Layer 1: static analysis (syntax, imports)
+        # Layer 2: security scan (eval, shell=True, secrets) — hard block
+        # Layer 3: semantic review (LLM-as-judge — independent critic)
+        max_attempts = self.tester.config.max_fix_attempts if self.tester.config else 3
+        guardrail_attempt = 0
+        while True:
+            self.ui.agent_started(
+                "GUARDRAIL",
+                f"Validating fix — attempt {guardrail_attempt + 1}/{max_attempts}"
+            )
+            guardrail_result = self.guardrail.run(incident)
+            self.ui.agent_done("GUARDRAIL", {
+                "passed": guardrail_result.passed,
+                "layer": guardrail_result.layer,
+                "reason": guardrail_result.reason,
+                "hard_block": guardrail_result.hard_block,
+            })
+
+            if guardrail_result.passed:
+                break
+
+            if guardrail_result.hard_block:
+                # Security violation — never retry, always escalate
+                todo_list.fail(2, f"SECURITY BLOCK: {guardrail_result.reason}")
+                return self._escalate(
+                    incident,
+                    f"Security violation in generated fix: {guardrail_result.reason}",
+                    start,
+                )
+
+            guardrail_attempt += 1
+            if guardrail_attempt >= max_attempts:
+                todo_list.fail(2, "Guardrail failed after max attempts")
+                self.rollback.run(incident, incident.pr_branch)
+                self.learner.run(incident, verified=False)
+                return self._fail(
+                    incident,
+                    f"Guardrail rejected fix after {max_attempts} attempts — rolled back",
+                    start,
+                )
+
+            # Send specific failure reason back to Coder for revision
+            self.ui.agent_started(
+                "CODER",
+                f"Revising fix based on guardrail feedback: {guardrail_result.specific_issue}"
+            )
+            revised_result = self.coder.run_revision(
+                incident,
+                feedback=guardrail_result.reason,
+                specific_issue=guardrail_result.specific_issue,
+            )
+            if not revised_result.get("fix_written"):
+                todo_list.fail(2, "Coder could not revise fix")
+                return self._escalate(incident, "Coder revision failed", start)
+            self.ui.agent_done("CODER", revised_result)
+            self.ui.show_diff(incident)
 
         # ── TEST + DECISION ───────────────────────────────────────────
         self.ui.agent_started("TESTER", "Running tests + making deploy decision")
@@ -4329,7 +4780,7 @@ git commit -m "feat: complete self-healing system — demo app, watcher, UI, mai
 | 2 | Signal, Incident, TodoList, OllamaClient | test_signal, test_incident, test_todo_list, test_llm |
 | 3 | Neo4j client + KG builder + embedder + querier | test_kg_builder, test_kg_querier |
 | 4 | Categoriser Stage 1 + Stage 2 + Transient + Router | test_categoriser_stage1, test_categoriser_stage2 |
-| 5 | Observer, Detective, Coder, Tester (with deploy decision), Committer | test_observer, test_coder, test_tester, test_committer |
+| 5 | Observer, Detective, Coder, Guardrail, Tester (deploy decision), Committer | test_observer, test_coder, test_guardrail, test_tester, test_committer |
 | 6 | Operator, Executor, InfraVerifier | test_operator |
 | 7 | RollbackEngine | test_rollback |
 | 8 | LearnerAgent → KG feedback | test_learner |

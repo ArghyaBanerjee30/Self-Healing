@@ -114,7 +114,11 @@ Every time a routine production failure requires a human, that is:
 │                                                                           │
 │  3. DISPATCH subagents in sequence                                        │
 │                                                                           │
-│  4. READ deployment decision from Tester (deterministic rule)            │
+│  4. READ guardrail verdict — static analysis, security scan, semantic review
+     Security violation → hard block, escalate, no retry
+     Other failure → send back to Coder with specific feedback, retry
+
+  5. READ deployment decision from Tester (deterministic rule)            │
 │                                                                           │
 │  5. DELIVER via Committer (direct deploy or PR)                          │
 │                                                                           │
@@ -148,6 +152,32 @@ Every time a routine production failure requires a human, that is:
   │  past patterns│
   │  + diff       │
   └────┬──────────┘
+       │
+  ┌────▼──────────────────────────────────────────────┐
+  │  GUARDRAIL AGENT                    ← NEW         │
+  │                                                    │
+  │  Layer 1 — Static Analysis (< 1s, no LLM)         │
+  │    AST parse: syntax errors, undefined vars        │
+  │    ruff/pyflakes: imports, code smells             │
+  │    FAIL → send back to Coder with specific error   │
+  │                                                    │
+  │  Layer 2 — Security Scan (< 2s, no LLM)           │
+  │    bandit/semgrep: eval(), exec(), shell=True      │
+  │    hardcoded secrets, unsafe deserialization       │
+  │    FAIL → HARD BLOCK, escalate, never retry        │
+  │                                                    │
+  │  Layer 3 — Semantic Review (LLM-as-judge, ~10s)   │
+  │    Separate LLM call — acts as critic, not fixer   │
+  │    Rejects: bare except:pass                       │
+  │    Rejects: fake return values masking errors      │
+  │    Rejects: fix does not address stated root cause │
+  │    Rejects: signature/return type changed          │
+  │    Checks: consistent with KG past fix patterns    │
+  │    FAIL → send back to Coder with specific reason  │
+  │                                                    │
+  │  All three pass → proceed to Tester                │
+  │  Revision counts against max_fix_attempts          │
+  └────┬──────────────────────────────────────────────┘
        │
   ┌────▼──────────────────────────────────────────────┐
   │  TESTER                                            │
@@ -244,6 +274,112 @@ WHY THIS IS BETTER THAN LLM SCORING:
   - Auditable: a human can inspect the diff and verify the decision
   - Honest: doesn't pretend to measure "confidence" in LLM output
   - Incentivises correctness: agent is motivated to write tests
+```
+
+---
+
+## Guardrail Agent — Three-Layer Code Validation
+
+The Guardrail Agent sits between the Coder and the Tester. It ensures the LLM-written fix meets quality, safety, and semantic correctness standards before any test is run or file is written to disk.
+
+**Why tests alone are not enough:**
+
+```
+Tests passing ≠ code is safe or correct
+
+LLM can write code that:
+  - passes all tests AND silently swallows exceptions (bare except: pass)
+  - passes all tests AND returns fake success values masking real errors
+  - passes all tests AND introduces a shell injection vulnerability
+  - passes all tests AND changes the function's contract (return type, signature)
+
+The test suite proves the fix does not break existing behaviour.
+The Guardrail proves the fix is actually a good fix.
+```
+
+**Three layers, each catching different risks:**
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  LAYER 1: STATIC ANALYSIS  (< 1 second, no LLM, no network)      │
+│                                                                    │
+│  Tool: AST parse + ruff + pyflakes (Python)                       │
+│        eslint (JavaScript), javac dry-run (Java)                  │
+│                                                                    │
+│  Catches:                                                          │
+│    - Syntax errors (LLM occasionally produces malformed code)     │
+│    - Undefined variable references                                 │
+│    - Invalid imports                                               │
+│    - Obvious unused variables / dead code introduced by fix       │
+│                                                                    │
+│  On FAIL: return specific error line to Coder for revision        │
+│  On PASS: proceed to Layer 2                                       │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  LAYER 2: SECURITY SCAN  (< 2 seconds, no LLM, no network)       │
+│                                                                    │
+│  Tool: bandit (Python) / semgrep rules                            │
+│                                                                    │
+│  Catches:                                                          │
+│    - eval() or exec() with any variable input                     │
+│    - subprocess with shell=True                                    │
+│    - Hardcoded credentials, API keys, passwords                   │
+│    - SQL string concatenation (injection risk)                    │
+│    - Unsafe deserialization (pickle.loads on untrusted input)     │
+│                                                                    │
+│  On FAIL: HARD BLOCK — no retry, no PR, escalate immediately     │
+│           A self-healing system must never introduce a            │
+│           security vulnerability to fix a bug                     │
+│  On PASS: proceed to Layer 3                                       │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  LAYER 3: SEMANTIC REVIEW  (~10 seconds, LLM-as-judge)            │
+│                                                                    │
+│  A second, independent LLM call with a critic system prompt.      │
+│  This LLM did not write the fix. Its only job is to reject it.   │
+│                                                                    │
+│  System prompt instructs the judge to REJECT if:                  │
+│    - Fix uses bare except: pass or except: continue               │
+│    - Fix returns a fake/default value instead of raising an error │
+│    - Fix does not actually address the stated root cause          │
+│    - Fix changes the function signature or return type            │
+│    - Fix introduces new external dependencies                     │
+│    - Fix scope is disproportionate (30+ lines for a guard clause) │
+│    - Fix pattern contradicts past successful fixes in KG          │
+│                                                                    │
+│  Output format (strict):                                          │
+│    VERDICT: PASS or FAIL                                          │
+│    REASON: one sentence                                           │
+│    SPECIFIC_ISSUE: exact problem (if FAIL)                        │
+│                                                                    │
+│  On FAIL: specific issue sent to Coder for targeted revision      │
+│           revision counts against max_fix_attempts                │
+│  On PASS: proceed to Tester                                        │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**Retry flow:**
+
+```
+CODER writes fix
+    │
+    ▼
+GUARDRAIL Layer 1 (static)
+    ├── PASS → Layer 2
+    └── FAIL → Coder (with error) → attempt N+1
+
+GUARDRAIL Layer 2 (security)
+    ├── PASS → Layer 3
+    └── FAIL → HARD BLOCK → escalate (no retry ever)
+
+GUARDRAIL Layer 3 (semantic)
+    ├── PASS → Tester
+    └── FAIL → Coder (with SPECIFIC_ISSUE) → attempt N+1
+
+max_fix_attempts covers total Coder+Guardrail cycle.
+If max_fix_attempts exhausted → rollback + escalate.
 ```
 
 ---
