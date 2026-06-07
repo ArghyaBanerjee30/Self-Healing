@@ -5,7 +5,7 @@ set -e
 # ./deploy.sh <path-to-repo>
 #
 # Example:
-#   ./deploy.sh /Users/arghyabanerjee/Desktop/developer-joi-delivery-python
+# ./deploy.sh /Users/arghyabanerjee/Desktop/developer-joi-delivery-python
 
 REPO_PATH="${1}"
 
