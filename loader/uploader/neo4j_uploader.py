@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from collections import defaultdict
@@ -6,7 +7,7 @@ from typing import Any, LiteralString
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
-from loader.utils import batches, save_hashes
+from loader.utils import batches
 
 load_dotenv()
 
@@ -15,7 +16,9 @@ logger = logging.getLogger(__name__)
 NODE_BATCH_SIZE = 10
 EDGE_BATCH_SIZE = 500
 
-# ── Static Cypher queries (LiteralString) ─────────────────────────────────────
+MANIFEST_ID = "self_healing_manifest"
+
+# ── Static Cypher queries ─────────────────────────────────────────────────────
 
 _DELETE_BY_PATH: LiteralString = """
 UNWIND $paths AS p
@@ -33,7 +36,22 @@ SET n += node
 RETURN count(n)
 """
 
-# Edge queries are built per rel_type — handled separately in upsert_edges()
+_SAVE_MANIFEST: LiteralString = """
+MERGE (m:Manifest {id: $id})
+SET m.node_hashes = $node_hashes,
+    m.edge_hash   = $edge_hash,
+    m.edge_list   = $edge_list,
+    m.updated_at  = timestamp()
+"""
+
+_LOAD_MANIFEST: LiteralString = """
+MATCH (m:Manifest {id: $id})
+RETURN m.node_hashes AS node_hashes,
+       m.edge_hash   AS edge_hash,
+       m.edge_list   AS edge_list
+"""
+
+# Edge query template — dynamic rel type, routed through _run_dynamic
 _EDGE_QUERY_TEMPLATE = """
 UNWIND $batch AS edge
 MATCH (a {{id: edge.from_id}})
@@ -58,10 +76,50 @@ class Neo4jUploader:
                 session.run(cypher, params or {})
 
     def _run_dynamic(self, cypher: str, params: dict[str, Any] | None = None) -> None:
-        """For queries built at runtime (e.g. edge type interpolation)."""
+        """For queries with runtime-interpolated rel types."""
         with GraphDatabase.driver(self.uri, auth=self.auth) as driver:
             with driver.session(database=self.database) as session:
                 session.run(cypher, params or {})  # type: ignore[arg-type]
+
+    def _query(self, cypher: LiteralString, params: dict[str, Any] | None = None) -> list:
+        with GraphDatabase.driver(self.uri, auth=self.auth) as driver:
+            with driver.session(database=self.database) as session:
+                return list(session.run(cypher, params or {}))
+
+    # ── Manifest node ─────────────────────────────────────────────────────────
+
+    def load_manifest(self) -> dict:
+        """Read stored hashes from the Manifest node. Returns {} if not found."""
+        records = self._query(_LOAD_MANIFEST, {"id": MANIFEST_ID})
+        if not records:
+            return {}
+        row = records[0]
+        try:
+            return {
+                "node_hashes": json.loads(row["node_hashes"] or "{}"),
+                "edge_hash":   row["edge_hash"] or "",
+                "edge_list":   json.loads(row["edge_list"] or "[]"),
+            }
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    def save_manifest(
+        self,
+        node_hashes: dict,
+        edge_hash: str,
+        edge_list: list[dict],
+    ) -> None:
+        """Persist hashes into the Manifest node in Neo4j."""
+        self._run(
+            _SAVE_MANIFEST,
+            {
+                "id":          MANIFEST_ID,
+                "node_hashes": json.dumps(node_hashes),
+                "edge_hash":   edge_hash,
+                "edge_list":   json.dumps(edge_list),
+            },
+        )
+        logger.info("Manifest node updated in Neo4j.")
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
@@ -89,12 +147,11 @@ class Neo4jUploader:
         flat_nodes = [self._flatten(n) for n in nodes]
         for i, batch in enumerate(batches(flat_nodes, NODE_BATCH_SIZE), 1):
             self._run(_UPSERT_NODE, {"batch": batch})
-            logger.info(f"  Nodes: {i * NODE_BATCH_SIZE}/{len(nodes)}")
+            logger.info(f"  Nodes: {min(i * NODE_BATCH_SIZE, len(nodes))}/{len(nodes)}")
 
     # ── Edges ─────────────────────────────────────────────────────────────────
 
     def upsert_edges(self, edges: list[dict]) -> None:
-        """Groups by rel type — Cypher rel type cannot be parameterised."""
         if not edges:
             return
         by_type: dict[str, list] = defaultdict(list)
@@ -115,8 +172,9 @@ class Neo4jUploader:
         nodes_to_write: list[dict],
         edges_to_write: list[dict],
         paths_to_purge: list[str],
-        hashes_to_save: dict,
-        hashes_path: str,
+        node_hashes: dict,
+        edge_hash: str,
+        edge_list: list[dict],
     ) -> None:
         self.delete_by_paths(paths_to_purge)
 
@@ -126,7 +184,8 @@ class Neo4jUploader:
         logger.info(f"Writing {len(edges_to_write)} edges ...")
         self.upsert_edges(edges_to_write)
 
-        save_hashes(hashes_path, hashes_to_save)
+        self.save_manifest(node_hashes, edge_hash, edge_list)
+
         logger.info(
             f"Upload complete — {len(nodes_to_write)} nodes, "
             f"{len(edges_to_write)} edges written."
