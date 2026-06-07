@@ -1,0 +1,9 @@
+.git
+.gitignore
+.DS_Store
+.idea/
+.venv/
+docs/
+loader/output/
+**/__pycache__/
+**/*.pyc

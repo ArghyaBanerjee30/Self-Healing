@@ -1,0 +1,6 @@
+FROM neo4j:5.15.0
+
+COPY ./conf /conf
+
+EXPOSE 7474
+EXPOSE 7687

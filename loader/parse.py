@@ -24,7 +24,11 @@ class _NoOpObserver:
         pass
 
 
-def parse_and_upload(input_path: str, project_name: str, output_path: str) -> None:
+PROJECT_NAME = "my_project"
+
+
+def parse_and_upload(input_path: str, output_path: str) -> None:
+    project_name = PROJECT_NAME
     output = Path(output_path)
     hashes_path = str(output) + HASHES_SUFFIX
 
@@ -166,9 +170,8 @@ def parse_and_upload(input_path: str, project_name: str, output_path: str) -> No
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Parse a Python repo and upload to Neo4j")
-    ap.add_argument("--input",        required=True,                      help="Path to the repo directory")
-    ap.add_argument("--output",       default="loader/output/graph.json", help="Output JSON path")
-    ap.add_argument("--project-name", default="",                         help="Project label")
+    ap.add_argument("--input",  required=True,                      help="Path to the repo directory")
+    ap.add_argument("--output", default="loader/output/graph.json", help="Output JSON path")
     args = ap.parse_args()
 
-    parse_and_upload(args.input, args.project_name, args.output)
+    parse_and_upload(args.input, args.output)
