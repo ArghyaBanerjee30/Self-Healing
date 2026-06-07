@@ -1,6 +1,8 @@
 import argparse
 import json
 import logging
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from loader.parsers.python.python_parser import PythonParser
@@ -20,8 +22,62 @@ class _NoOpObserver:
         pass
 
 
+# ── Stats tracker ─────────────────────────────────────────────────────────────
+
+@dataclass
+class LoaderStats:
+    # Timings (seconds)
+    t_parse:     float = 0.0
+    t_diff:      float = 0.0
+    t_embed:     float = 0.0
+    t_upload:    float = 0.0
+    t_total:     float = 0.0
+
+    # Counts
+    files_parsed:       int = 0
+    nodes_total:        int = 0
+    edges_total:        int = 0
+    nodes_new:          int = 0
+    nodes_changed:      int = 0
+    nodes_deleted:      int = 0
+    nodes_written:      int = 0
+    edges_written:      int = 0
+    functions_embedded: int = 0
+    tokens_consumed:    int = 0   # estimated: chars / 3
+
+    def print(self) -> None:
+        sep = "─" * 44
+        logger.info("")
+        logger.info(sep)
+        logger.info("  Loader Stats")
+        logger.info(sep)
+        logger.info(f"  Files parsed       : {self.files_parsed}")
+        logger.info(f"  Nodes (total)      : {self.nodes_total}")
+        logger.info(f"  Edges (total)      : {self.edges_total}")
+        logger.info(sep)
+        logger.info(f"  Nodes written      : {self.nodes_written}")
+        logger.info(f"    new              : {self.nodes_new}")
+        logger.info(f"    changed          : {self.nodes_changed}")
+        logger.info(f"    deleted          : {self.nodes_deleted}")
+        logger.info(f"  Edges written      : {self.edges_written}")
+        logger.info(sep)
+        logger.info(f"  Functions embedded : {self.functions_embedded}")
+        logger.info(f"  Tokens consumed    : ~{self.tokens_consumed:,}  (estimated)")
+        logger.info(sep)
+        logger.info(f"  Parse time         : {self.t_parse:.2f}s")
+        logger.info(f"  Diff time          : {self.t_diff:.2f}s")
+        logger.info(f"  Embed time         : {self.t_embed:.2f}s")
+        logger.info(f"  Upload time        : {self.t_upload:.2f}s")
+        logger.info(f"  Total time         : {self.t_total:.2f}s")
+        logger.info(sep)
+
+
 def parse_and_upload(input_path: str, output_path: str) -> None:
+    stats = LoaderStats()
+    t_start = time.perf_counter()
+
     # ── Step 1: Parse source files ────────────────────────────────────────────
+    t0 = time.perf_counter()
     file_paths = {str(p) for p in Path(input_path).rglob("*.py")}
     if not file_paths:
         logger.warning(f"No .py files found in {input_path}")
@@ -34,21 +90,26 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
     )
     result = convert(nodes, relationships, project_name=PROJECT_NAME)
 
-    # ── Step 2: Write graph.json ──────────────────────────────────────────────
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     with open(output, "w") as f:
         json.dump(result, f, indent=2, default=str)
 
-    # ── Step 3: Load previous state from Neo4j Manifest node ─────────────────
+    stats.t_parse     = time.perf_counter() - t0
+    stats.files_parsed = len(file_paths)
+    stats.nodes_total  = len(result.get("nodes", []))
+    stats.edges_total  = len(result.get("edges", []))
+
+    # ── Step 2: Load previous state from Neo4j Manifest node ─────────────────
+    t0 = time.perf_counter()
     uploader = Neo4jUploader()
     stored = uploader.load_manifest()
 
     stored_node_hashes: dict = stored.get("node_hashes", {})
-    stored_edge_hash: str   = stored.get("edge_hash", "")
-    stored_edge_list: list  = stored.get("edge_list", [])
+    stored_edge_hash: str    = stored.get("edge_hash", "")
+    stored_edge_list: list   = stored.get("edge_list", [])
 
-    # ── Step 4: Diff nodes ────────────────────────────────────────────────────
+    # ── Step 3: Diff nodes ────────────────────────────────────────────────────
     current_nodes: dict[str, dict] = {n["id"]: n for n in result.get("nodes", [])}
     current_edges: list[dict]      = result.get("edges", [])
 
@@ -66,11 +127,16 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
     }
     deleted_ids = set(stored_node_hashes) - set(current_nodes)
 
-    # ── Step 5: Diff edges ────────────────────────────────────────────────────
+    # ── Step 4: Diff edges ────────────────────────────────────────────────────
     current_edge_hash, sorted_edges = hash_edges(current_edges)
     edges_changed = current_edge_hash != stored_edge_hash
 
-    # ── Step 6: Log summary ───────────────────────────────────────────────────
+    stats.t_diff       = time.perf_counter() - t0
+    stats.nodes_new     = len(new_ids)
+    stats.nodes_changed = len(changed_ids)
+    stats.nodes_deleted = len(deleted_ids)
+
+    # ── Step 5: Log diff summary ──────────────────────────────────────────────
     logger.info(f"Manifest → {output_path}")
     logger.info(f"  Total  : {len(current_nodes)} nodes, {len(current_edges)} edges")
 
@@ -78,6 +144,8 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         logger.info("  Status : first run — all nodes are new")
     elif not new_ids and not changed_ids and not deleted_ids and not edges_changed:
         logger.info("  Status : all nodes and edges unchanged — skipping upload.")
+        stats.t_total = time.perf_counter() - t_start
+        stats.print()
         return
     else:
         if new_ids:
@@ -89,7 +157,7 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         if edges_changed:
             logger.info("  Edges   : changed")
 
-    # ── Step 7: Compute what to purge and write ───────────────────────────────
+    # ── Step 6: Compute what to purge and write ───────────────────────────────
     paths_to_purge: set[str] = {
         stored_node_hashes[nid]["path"]
         for nid in (changed_ids | deleted_ids)
@@ -129,7 +197,11 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         if e["from_id"] in write_ids or e["to_id"] in write_ids
     ]
 
-    # ── Step 8: Generate embeddings for FUNCTION nodes ───────────────────────
+    stats.nodes_written = len(nodes_to_write)
+    stats.edges_written = len(edges_to_write)
+
+    # ── Step 7: Generate embeddings for FUNCTION nodes ────────────────────────
+    t0 = time.perf_counter()
     function_nodes = [
         n for n in nodes_to_write
         if n.get("type") == "FUNCTION" and n.get("code", "").strip()
@@ -144,8 +216,14 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
             {"id": n["id"], "embedding": v}
             for n, v in zip(function_nodes, vectors)
         ]
+        total_chars = sum(len(c) for c in codes)
+        stats.functions_embedded = len(function_nodes)
+        stats.tokens_consumed    = total_chars // 3  # ~3 chars per token for Python
 
-    # ── Step 9: Upload to Neo4j ───────────────────────────────────────────────
+    stats.t_embed = time.perf_counter() - t0
+
+    # ── Step 8: Upload to Neo4j ───────────────────────────────────────────────
+    t0 = time.perf_counter()
     uploader.upload(
         nodes_to_write=nodes_to_write,
         edges_to_write=edges_to_write,
@@ -155,6 +233,10 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         edge_list=sorted_edges,
         embeddings=embeddings,
     )
+    stats.t_upload = time.perf_counter() - t0
+
+    stats.t_total = time.perf_counter() - t_start
+    stats.print()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
