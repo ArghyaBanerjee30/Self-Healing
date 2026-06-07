@@ -1,6 +1,7 @@
 import logging
 import os
 from collections import defaultdict
+from typing import Any, LiteralString
 
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
@@ -14,6 +15,33 @@ logger = logging.getLogger(__name__)
 NODE_BATCH_SIZE = 10
 EDGE_BATCH_SIZE = 500
 
+# ── Static Cypher queries (LiteralString) ─────────────────────────────────────
+
+_DELETE_BY_PATH: LiteralString = """
+UNWIND $paths AS p
+MATCH (n) WHERE n.path = p
+OPTIONAL MATCH (n)-[:MADE_OF*]->(child)
+WITH collect(n) + collect(child) AS to_delete
+UNWIND to_delete AS nd
+DETACH DELETE nd
+"""
+
+_UPSERT_NODE: LiteralString = """
+UNWIND $batch AS node
+MERGE (n {id: node.id, type: node.type})
+SET n += node
+RETURN count(n)
+"""
+
+# Edge queries are built per rel_type — handled separately in upsert_edges()
+_EDGE_QUERY_TEMPLATE = """
+UNWIND $batch AS edge
+MATCH (a {{id: edge.from_id}})
+MATCH (b {{id: edge.to_id}})
+MERGE (a)-[r:{rel_type}]->(b)
+RETURN count(r)
+"""
+
 
 class Neo4jUploader:
     def __init__(self, database: str = "neo4j"):
@@ -24,9 +52,16 @@ class Neo4jUploader:
         )
         self.database = database
 
-    def _run(self, cypher: str, params: dict):
+    def _run(self, cypher: LiteralString, params: dict[str, Any] | None = None) -> None:
         with GraphDatabase.driver(self.uri, auth=self.auth) as driver:
-            driver.execute_query(cypher, params or {}, database_=self.database)
+            with driver.session(database=self.database) as session:
+                session.run(cypher, params or {})
+
+    def _run_dynamic(self, cypher: str, params: dict[str, Any] | None = None) -> None:
+        """For queries built at runtime (e.g. edge type interpolation)."""
+        with GraphDatabase.driver(self.uri, auth=self.auth) as driver:
+            with driver.session(database=self.database) as session:
+                session.run(cypher, params or {})  # type: ignore[arg-type]
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
@@ -34,49 +69,32 @@ class Neo4jUploader:
         if not paths:
             return
         for batch in batches(paths, EDGE_BATCH_SIZE):
-            self._run(
-                """
-                UNWIND $paths AS p
-                MATCH (n) WHERE n.path = p
-                OPTIONAL MATCH (n)-[:MADE_OF*]->(child)
-                WITH collect(n) + collect(child) AS to_delete
-                UNWIND to_delete AS nd
-                DETACH DELETE nd
-                """,
-                {"paths": batch},
-            )
+            self._run(_DELETE_BY_PATH, {"paths": batch})
         logger.info(f"Deleted nodes for {len(paths)} paths")
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _flatten(node: dict) -> dict:
+        """Flatten additional_properties into top-level keys Neo4j can store."""
+        flat = {k: v for k, v in node.items() if k != "additional_properties"}
+        for k, v in (node.get("additional_properties") or {}).items():
+            if not isinstance(v, dict):
+                flat[f"ap_{k}"] = v
+        return flat
+
     def upsert_nodes(self, nodes: list[dict]) -> None:
         if not nodes:
             return
-        for i, batch in enumerate(batches(nodes, NODE_BATCH_SIZE), 1):
-            self._run(
-                """
-                UNWIND $batch AS node
-                MERGE (n {id: node.id, type: node.type})
-                SET n.display_name          = node.display_name,
-                    n.path                  = node.path,
-                    n.language              = coalesce(node.language, ''),
-                    n.code                  = coalesce(node.code, ''),
-                    n.loc                   = coalesce(node.loc, 0),
-                    n.cyclomatic_complexity = coalesce(node.cyclomatic_complexity, 1),
-                    n.category              = node.category,
-                    n.generator             = coalesce(node.generator, ''),
-                    n.project_name          = coalesce(node.project_name, ''),
-                    n.additional_properties = node.additional_properties
-                RETURN count(n)
-                """,
-                {"batch": batch},
-            )
+        flat_nodes = [self._flatten(n) for n in nodes]
+        for i, batch in enumerate(batches(flat_nodes, NODE_BATCH_SIZE), 1):
+            self._run(_UPSERT_NODE, {"batch": batch})
             logger.info(f"  Nodes: {i * NODE_BATCH_SIZE}/{len(nodes)}")
 
     # ── Edges ─────────────────────────────────────────────────────────────────
 
     def upsert_edges(self, edges: list[dict]) -> None:
-        """Groups edges by relationship type — Cypher rel type must be a literal."""
+        """Groups by rel type — Cypher rel type cannot be parameterised."""
         if not edges:
             return
         by_type: dict[str, list] = defaultdict(list)
@@ -84,20 +102,13 @@ class Neo4jUploader:
             by_type[e["type"]].append(e)
 
         for rel_type, group in by_type.items():
+            cypher = _EDGE_QUERY_TEMPLATE.format(rel_type=rel_type)
             for batch in batches(group, EDGE_BATCH_SIZE):
-                self._run(
-                    f"""
-                    UNWIND $batch AS edge
-                    MATCH (a {{id: edge.from_id}})
-                    MATCH (b {{id: edge.to_id}})
-                    MERGE (a)-[r:{rel_type}]->(b)
-                    RETURN count(r)
-                    """,
-                    {"batch": batch},
-                )
+                self._run_dynamic(cypher, {"batch": batch})
+
         logger.info(f"  Edges: {len(edges)}/{len(edges)}")
 
-    # ── Main entry: accepts pre-computed diff from parse.py ───────────────────
+    # ── Main entry ────────────────────────────────────────────────────────────
 
     def upload(
         self,
