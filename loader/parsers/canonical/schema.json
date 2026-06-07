@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CodeConcise Ingestion Manifest",
+  "type": "object",
+  "required": ["version", "generator", "nodes", "edges"],
+  "properties": {
+    "version": { "type": "string", "enum": ["1.0"] },
+    "generator": { "type": "string" },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "display_name", "type", "path", "generator", "category"],
+        "properties": {
+          "id":           { "type": "string", "minLength": 1 },
+          "display_name": { "type": "string" },
+          "type":         { "type": "string" },
+          "code":         { "type": "string" },
+          "path":         { "type": "string" },
+          "language":     { "type": "string" },
+          "generator":    { "type": "string" },
+          "loc":          { "type": "integer", "minimum": 0 },
+          "cyclomatic_complexity": { "type": "integer", "minimum": 0 },
+          "category":     { "type": "array", "items": { "type": "string" } },
+          "additional_properties": { "type": "object" }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from_id", "to_id", "type"],
+        "properties": {
+          "from_id": { "type": "string" },
+          "to_id":   { "type": "string" },
+          "type":    { "type": "string" }
+        }
+      }
+    }
+  }
+}
