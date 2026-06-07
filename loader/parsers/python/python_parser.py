@@ -9,7 +9,7 @@ from typing import Protocol
 import tree_sitter_python
 from tree_sitter import Language, Node, Parser
 
-from parsers.python.python_models import (
+from loader.parsers.python.python_models import (
     PythonNode,
     PythonNodeType,
     PythonRelationship,

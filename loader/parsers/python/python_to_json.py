@@ -3,10 +3,10 @@
 import os
 from typing import Any
 
-from parsers.canonical.invariants import build_parse_result
-from parsers.common.dedup import build_display_codes
-from parsers.common.metrics import cc, loc
-from parsers.python.python_models import PythonNode, PythonNodeType, PythonRelationship
+from loader.parsers.canonical.invariants import build_parse_result
+from loader.parsers.common.dedup import build_display_codes
+from loader.parsers.common.metrics import cc, loc
+from loader.parsers.python.python_models import PythonNode, PythonNodeType, PythonRelationship
 
 # Top-level types that get MADE_OF edges from FILE nodes.
 _TOP_LEVEL_TYPES = frozenset(
