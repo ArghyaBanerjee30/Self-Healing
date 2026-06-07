@@ -17,6 +17,8 @@ NODE_BATCH_SIZE = 10
 EDGE_BATCH_SIZE = 500
 
 MANIFEST_ID = "self_healing_manifest"
+VECTOR_INDEX_NAME = "function_embeddings"
+VECTOR_DIMENSIONS = 384
 
 # ── Static Cypher queries ─────────────────────────────────────────────────────
 
@@ -37,8 +39,7 @@ SET n += node
 RETURN count(n)
 """
 
-_SAVE_MANIFEST: LiteralString = """
-MERGE (m:Manifest {id: $id})
+_SAVE_MANIFEST: LiteralString = """MERGE (m:Manifest {id: $id})
 SET m.node_hashes = $node_hashes,
     m.edge_hash   = $edge_hash,
     m.edge_list   = $edge_list,
@@ -177,6 +178,37 @@ class Neo4jUploader:
 
         logger.info(f"  Edges: {len(edges)}/{len(edges)}")
 
+    # ── Vector index ─────────────────────────────────────────────────────────
+
+    def ensure_vector_index(self) -> None:
+        """Create the vector index on FUNCTION.embedding if it doesn't exist."""
+        cypher = (
+            f"CREATE VECTOR INDEX {VECTOR_INDEX_NAME} IF NOT EXISTS "
+            f"FOR (n:FUNCTION) ON n.embedding "
+            f"OPTIONS {{indexConfig: {{"
+            f"`vector.dimensions`: {VECTOR_DIMENSIONS}, "
+            f"`vector.similarity_function`: 'cosine'"
+            f"}}}}"
+        )
+        self._run_dynamic(cypher)
+        logger.info(f"Vector index '{VECTOR_INDEX_NAME}' ensured.")
+
+    def upsert_embeddings(self, embeddings: list[dict]) -> None:
+        """
+        embeddings: list of {"id": <node_id>, "embedding": [float, ...]}
+        Stores embedding on the matching FUNCTION node.
+        """
+        if not embeddings:
+            return
+        cypher = """
+        UNWIND $batch AS row
+        MATCH (n:FUNCTION {id: row.id})
+        SET n.embedding = row.embedding
+        """
+        for batch in batches(embeddings, NODE_BATCH_SIZE):
+            self._run_dynamic(cypher, {"batch": batch})
+        logger.info(f"  Embeddings: {len(embeddings)} stored.")
+
     # ── Main entry ────────────────────────────────────────────────────────────
 
     def upload(
@@ -187,6 +219,7 @@ class Neo4jUploader:
         node_hashes: dict,
         edge_hash: str,
         edge_list: list[dict],
+        embeddings: list[dict] | None = None,
     ) -> None:
         self.delete_by_paths(paths_to_purge)
 
@@ -195,6 +228,11 @@ class Neo4jUploader:
 
         logger.info(f"Writing {len(edges_to_write)} edges ...")
         self.upsert_edges(edges_to_write)
+
+        if embeddings:
+            self.ensure_vector_index()
+            logger.info(f"Storing {len(embeddings)} embeddings ...")
+            self.upsert_embeddings(embeddings)
 
         self.save_manifest(node_hashes, edge_hash, edge_list)
 

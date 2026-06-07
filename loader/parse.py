@@ -6,6 +6,7 @@ from pathlib import Path
 from loader.parsers.python.python_parser import PythonParser
 from loader.parsers.python.python_to_json import convert
 from loader.uploader.neo4j_uploader import Neo4jUploader
+from loader.embedder.code_embedder import CodeEmbedder
 from loader.utils import hash_node, hash_edges
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -128,7 +129,23 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         if e["from_id"] in write_ids or e["to_id"] in write_ids
     ]
 
-    # ── Step 8: Upload to Neo4j ───────────────────────────────────────────────
+    # ── Step 8: Generate embeddings for FUNCTION nodes ───────────────────────
+    function_nodes = [
+        n for n in nodes_to_write
+        if n.get("type") == "FUNCTION" and n.get("code", "").strip()
+    ]
+    embeddings: list[dict] = []
+    if function_nodes:
+        logger.info(f"Generating embeddings for {len(function_nodes)} functions ...")
+        embedder = CodeEmbedder()
+        codes = [n["code"] for n in function_nodes]
+        vectors = embedder.embed_batch(codes)
+        embeddings = [
+            {"id": n["id"], "embedding": v}
+            for n, v in zip(function_nodes, vectors)
+        ]
+
+    # ── Step 9: Upload to Neo4j ───────────────────────────────────────────────
     uploader.upload(
         nodes_to_write=nodes_to_write,
         edges_to_write=edges_to_write,
@@ -136,6 +153,7 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         node_hashes=current_node_hashes,
         edge_hash=current_edge_hash,
         edge_list=sorted_edges,
+        embeddings=embeddings,
     )
 
 
