@@ -29,9 +29,10 @@ UNWIND to_delete AS nd
 DETACH DELETE nd
 """
 
-_UPSERT_NODE: LiteralString = """
+# Per-type template — label is a literal interpolated in Python, not a Cypher parameter
+_UPSERT_NODE_TYPED = """
 UNWIND $batch AS node
-MERGE (n {id: node.id, type: node.type})
+MERGE (n:{label} {{id: node.id, type: node.type}})
 SET n += node
 RETURN count(n)
 """
@@ -145,9 +146,20 @@ class Neo4jUploader:
         if not nodes:
             return
         flat_nodes = [self._flatten(n) for n in nodes]
-        for i, batch in enumerate(batches(flat_nodes, NODE_BATCH_SIZE), 1):
-            self._run(_UPSERT_NODE, {"batch": batch})
-            logger.info(f"  Nodes: {min(i * NODE_BATCH_SIZE, len(nodes))}/{len(nodes)}")
+
+        # Group by type so the label can be a literal in the MERGE clause
+        by_type: dict[str, list] = defaultdict(list)
+        for n in flat_nodes:
+            by_type[n.get("type", "Node")].append(n)
+
+        total = len(flat_nodes)
+        written = 0
+        for label, group in by_type.items():
+            cypher = _UPSERT_NODE_TYPED.format(label=label)
+            for batch in batches(group, NODE_BATCH_SIZE):
+                self._run_dynamic(cypher, {"batch": batch})
+                written += len(batch)
+                logger.info(f"  Nodes: {written}/{total}")
 
     # ── Edges ─────────────────────────────────────────────────────────────────
 
