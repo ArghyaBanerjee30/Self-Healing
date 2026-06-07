@@ -14,6 +14,7 @@ prometheus-api-client>=0.5.4
 
 # Database
 # sqlite3 is part of the Python standard library — no extra package needed
+neo4j>=5.0.0
 
 # Terminal UI
 rich>=13.7.0
