@@ -2,13 +2,13 @@ import argparse
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
+from loader.embedder.code_embedder import CodeEmbedder
 from loader.parsers.python.python_parser import PythonParser
 from loader.parsers.python.python_to_json import convert
 from loader.uploader.neo4j_uploader import Neo4jUploader
-from loader.embedder.code_embedder import CodeEmbedder
 from loader.utils import hash_node, hash_edges
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -162,7 +162,8 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         stored_node_hashes[nid]["path"]
         for nid in (changed_ids | deleted_ids)
         if isinstance(stored_node_hashes.get(nid), dict)
-        and stored_node_hashes[nid].get("path")
+        and isinstance(stored_node_hashes[nid].get("path"), str)
+        and stored_node_hashes[nid]["path"]
     }
     if edges_changed:
         stored_edge_set = {
@@ -175,8 +176,10 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
         }
         for from_id, to_id, _ in stored_edge_set ^ current_edge_set:
             for nid in (from_id, to_id):
-                if nid in current_node_hashes and current_node_hashes[nid].get("path"):
-                    paths_to_purge.add(current_node_hashes[nid]["path"])
+                if nid in current_node_hashes:
+                    path = current_node_hashes[nid].get("path")
+                    if isinstance(path, str) and path:
+                        paths_to_purge.add(path)
 
     write_ids = (
         new_ids
