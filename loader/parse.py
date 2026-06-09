@@ -1,8 +1,10 @@
 import argparse
 import json
 import logging
+import shutil
+import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from loader.embedder.code_embedder import CodeEmbedder
@@ -35,6 +37,7 @@ class LoaderStats:
 
     # Counts
     files_parsed:       int = 0
+    loc_total:          int = 0
     nodes_total:        int = 0
     edges_total:        int = 0
     nodes_new:          int = 0
@@ -52,6 +55,7 @@ class LoaderStats:
         logger.info("  Loader Stats")
         logger.info(sep)
         logger.info(f"  Files parsed       : {self.files_parsed}")
+        logger.info(f"  Lines of code      : {self.loc_total:,}")
         logger.info(f"  Nodes (total)      : {self.nodes_total}")
         logger.info(f"  Edges (total)      : {self.edges_total}")
         logger.info(sep)
@@ -70,6 +74,40 @@ class LoaderStats:
         logger.info(f"  Upload time        : {self.t_upload:.2f}s")
         logger.info(f"  Total time         : {self.t_total:.2f}s")
         logger.info(sep)
+
+
+def _count_loc(input_path: str) -> int:
+    """
+    Count lines of code using cloc if available, otherwise fall back to
+    counting non-blank, non-comment lines in .py files ourselves.
+    Matches cloc's 'code' column for Python.
+    """
+    if shutil.which("cloc"):
+        try:
+            result = subprocess.run(
+                ["cloc", "--include-lang=Python", "--csv", "--quiet", input_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split(",")
+                # cloc CSV format: language,files,blank,comment,code
+                if len(parts) == 5 and parts[0].strip() == "Python":
+                    return int(parts[4].strip())
+        except Exception:
+            pass
+
+    # Fallback: count non-blank, non-comment lines ourselves
+    total = 0
+    for path in Path(input_path).rglob("*.py"):
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        total += 1
+        except OSError:
+            pass
+    return total
 
 
 def parse_and_upload(input_path: str, output_path: str) -> None:
@@ -95,10 +133,11 @@ def parse_and_upload(input_path: str, output_path: str) -> None:
     with open(output, "w") as f:
         json.dump(result, f, indent=2, default=str)
 
-    stats.t_parse     = time.perf_counter() - t0
+    stats.t_parse      = time.perf_counter() - t0
     stats.files_parsed = len(file_paths)
     stats.nodes_total  = len(result.get("nodes", []))
     stats.edges_total  = len(result.get("edges", []))
+    stats.loc_total    = _count_loc(input_path)
 
     # ── Step 2: Load previous state from Neo4j Manifest node ─────────────────
     t0 = time.perf_counter()
