@@ -64,7 +64,22 @@ async def route(
     # Transient gate
     # ------------------------------------------------------------------
     if stage1.transient_flag and not _skip_transient_gate:
-        watch_result = await _tw.watch(signal)
+        # Feed stage1's occurrence log into the transient watcher counter
+        # so the watcher sees occurrences recorded before it starts watching.
+        _tw.record_occurrence(signal)
+
+        def _get_count(s: Signal) -> int:
+            from categoriser.stage1 import _occurrence_log
+            key = f"{s.service}:{s.error_type}"
+            return len(_occurrence_log.get(key, []))
+
+        watch_result = await _tw.watch(
+            signal,
+            duration_seconds=60.0,
+            poll_interval_seconds=5.0,
+            escalation_threshold=3,
+            get_recent_count=_get_count,
+        )
         _tw.reset_counter(signal)
 
         if watch_result.outcome == _tw.WatchOutcome.RESOLVED:

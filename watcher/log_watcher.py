@@ -16,8 +16,9 @@ from config.tenant_registry import TenantConfig
 from core.signal import Signal, SignalSource
 
 # Matches: "ERROR payments - TypeError: 'NoneType' object is not subscriptable"
+# Also matches Python logging format: "2026-06-11 10:23:41 ERROR payments - TypeError: ..."
 _ERROR_LINE_RE = re.compile(
-    r"^(?:ERROR|EXCEPTION|FATAL)\s+([\w][\w-]*)\s+-\s+(\w+):\s+(.*)"
+    r"(?:^|.*\s)(?:ERROR|EXCEPTION|FATAL)\s+([\w][\w-]*)\s+-\s+(\w+):\s+(.*)"
 )
 
 # Matches the terminal exception line of a traceback, e.g. "TypeError: foo"
@@ -132,10 +133,11 @@ class LogWatcher:
         self._seen[key] = now
         self._callback(
             Signal(
+                source=SignalSource.APPLICATION_LOG,
                 service=self._service,
                 error_type=self._error_type,
-                error_message=self._error_message or "",
-                source=SignalSource.LOG,
+                raw_message=self._error_message or "",
                 stack_trace=stack_trace,
+                project_id=self._config.project_id,
             )
         )
