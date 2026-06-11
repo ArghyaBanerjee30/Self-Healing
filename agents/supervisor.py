@@ -17,6 +17,9 @@ from core.incident import IncidentPath
 from core.todo_list import TodoList
 from categoriser.domain import CategoryResult
 from agents.skills.loader import load_skill, skill_name
+from agents.code import observer as _observer_agent
+from agents.code import detective as _detective_agent
+from agents.code import coder as _coder_agent
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -126,6 +129,29 @@ def _fallback_plan(incident_id: str) -> tuple[str, TodoList]:
 # Subagent stubs — replaced by real implementations one by one
 # ---------------------------------------------------------------------------
 
+def _parse_observer_context(ctx: str, signal: Signal) -> "_observer_agent.ObserverResult":
+    """Extract ObserverResult from a context string (looks for '| {...}' JSON trailer)."""
+    try:
+        idx = ctx.rfind("| {")
+        if idx != -1:
+            return _observer_agent.ObserverResult.from_json(ctx[idx + 2:])
+    except Exception:
+        pass
+    # fallback: try to extract from stack trace directly
+    return _observer_agent.run(signal)
+
+
+def _parse_detective_context(ctx: str, signal: Signal) -> "Optional[_detective_agent.DetectiveResult]":
+    """Extract DetectiveResult from a context string."""
+    try:
+        idx = ctx.rfind("| {")
+        if idx != -1:
+            return _detective_agent.DetectiveResult.from_json(ctx[idx + 2:])
+    except Exception as e:
+        log.warning("[Supervisor] could not parse Detective context: %s", e)
+    return None
+
+
 def _run_subagent(agent: str, todo: str, signal: Signal, context: str) -> str:
     stubs = {
         "observer":   _stub_observer,
@@ -144,18 +170,32 @@ def _run_subagent(agent: str, todo: str, signal: Signal, context: str) -> str:
 
 
 def _stub_observer(todo: str, s: Signal, ctx: str) -> str:
-    if s.stack_trace:
-        for line in s.stack_trace.splitlines():
-            if 'File "' in line:
-                return f"[STUB] Extracted: {line.strip()}"
-    return f"[STUB] No stack trace — service={s.service}, error={s.error_type}"
+    result = _observer_agent.run(s)
+    if result.found:
+        return (
+            f"[Observer] file={result.file_path}  "
+            f"line={result.line}  function={result.function_name}  "
+            f"| {result.to_json()}"
+        )
+    return f"[Observer] no app frame found in stack trace — {s.service}/{s.error_type}"
 
 
 def _stub_detective(todo: str, s: Signal, ctx: str) -> str:
-    return (
-        f"[STUB] Detective: read source at location from Observer. "
-        f"KG: no past incidents for {s.service}. Root cause: missing null/guard check."
+    # Parse Observer result from context
+    obs = _parse_observer_context(ctx, s)
+    if not obs.found:
+        return f"[Detective] cannot proceed — Observer found no app file"
+
+    result = _detective_agent.run(s, obs)
+    summary = (
+        f"[Detective] file={result.file_path}:{result.line}  "
+        f"function={result.function_name}\n"
+        f"  callers: {result.callers or ['none in KG']}\n"
+        f"  tests: {result.related_tests or ['none found']}\n"
+        f"  root_cause: {result.root_cause}\n"
+        f"  pattern: {result.pattern}"
     )
+    return summary + f"\n| {result.to_json()}"
 
 
 def _stub_operator(todo: str, s: Signal, ctx: str) -> str:
@@ -167,7 +207,22 @@ def _stub_operator(todo: str, s: Signal, ctx: str) -> str:
 
 
 def _stub_coder(todo: str, s: Signal, ctx: str) -> str:
-    return "[STUB] Coder: wrote fix. Added test for the failing case. Diff: 6 lines."
+    det = _parse_detective_context(ctx, s)
+    if det is None:
+        return "[Coder] cannot proceed — Detective result not found in context"
+
+    result = _coder_agent.run(s, det)
+    if not result.fix_written:
+        return f"[Coder] fix NOT written: {result.fix_description}"
+
+    diff_preview = "\n".join(result.diff.splitlines()[:20])
+    return (
+        f"[Coder] fix written to {result.file_path}\n"
+        f"  {result.fix_description}\n"
+        f"  diff preview:\n{diff_preview}"
+        + (f"\n  ... ({len(result.diff.splitlines())} lines total)" if len(result.diff.splitlines()) > 20 else "")
+        + f"\n| {result.to_json()}"
+    )
 
 
 def _stub_guardrail(todo: str, s: Signal, ctx: str) -> str:
