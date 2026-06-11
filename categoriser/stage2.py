@@ -7,10 +7,10 @@ then returns suspicion scores that the router uses to break the ambiguity.
 
 import asyncio
 import logging
-from dataclasses import dataclass
 from typing import Optional, Protocol, runtime_checkable
 
 from core.signal import Signal
+from categoriser.domain import Stage2Diagnostics
 
 log = logging.getLogger(__name__)
 
@@ -28,12 +28,6 @@ class KGClient(Protocol):
     def get_fix_confidence(self, service: str, error_type: str, project_id: str) -> float:
         """Return average confidence of past successful fixes (0.0–1.0)."""
         ...
-
-
-@dataclass
-class Stage2Result:
-    code_suspicion_score: float   # 0.0–1.0
-    infra_suspicion_score: float  # 0.0–1.0
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +162,7 @@ def _score_from_signal_fields(signal: Signal) -> float:
 async def investigate(
     signal: Signal,
     kg_client: Optional[KGClient] = None,
-) -> Stage2Result:
+) -> Stage2Diagnostics:
     """
     Run the code-side and infra-side checks in parallel.
     Returns suspicion scores the router uses to resolve the ambiguity.
@@ -178,7 +172,7 @@ async def investigate(
         _check_infra_side(signal),
     )
 
-    return Stage2Result(
+    return Stage2Diagnostics(
         code_suspicion_score=code_score,
         infra_suspicion_score=infra_score,
     )

@@ -8,9 +8,9 @@ that the router uses to decide whether to act immediately or escalate to Stage 2
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass
 
 from core.signal import Signal
+from categoriser.domain import Stage1Diagnostics
 
 # Pod/container states that indicate an infrastructure failure.
 _INFRA_FAILURE_STATES = {
@@ -40,13 +40,6 @@ _STDLIB_PATH_FRAGMENTS = (
 _occurrence_log: dict[str, list[float]] = defaultdict(list)
 _TRANSIENT_WINDOW_SECONDS = 300   # 5-minute window
 _TRANSIENT_THRESHOLD = 3          # fewer than 3 hits in window → transient
-
-
-@dataclass
-class Stage1Result:
-    code_signal: bool
-    infra_signal: bool
-    transient_flag: bool
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +115,13 @@ def _is_transient(signal: Signal) -> bool:
 # Public interface
 # ---------------------------------------------------------------------------
 
-def classify(signal: Signal) -> Stage1Result:
+def classify(signal: Signal) -> Stage1Diagnostics:
     """
     Classify a Signal in < 1 second with no external I/O.
 
-    Returns a Stage1Result the router uses to determine the healing path.
+    Returns a Stage1Diagnostics the router uses to determine the healing path.
     """
-    return Stage1Result(
+    return Stage1Diagnostics(
         code_signal=_has_app_stack_trace(signal),
         infra_signal=_is_pod_failed(signal),
         transient_flag=_is_transient(signal),

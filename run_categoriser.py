@@ -14,7 +14,8 @@ from rich import box
 from core.signal import Signal, SignalSource
 from core.incident import IncidentPath, IncidentConfidence
 from categoriser import stage1 as s1
-from categoriser.router import route, RoutingResult
+from categoriser.domain import CategoryResult
+from categoriser.router import route
 
 console = Console()
 
@@ -100,7 +101,7 @@ def _seed_past_transient(sig: Signal, n: int = 4) -> None:
         s1._is_transient(sig)
 
 
-def _render_result(label: str, sig: Signal, result: RoutingResult) -> None:
+def _render_result(label: str, sig: Signal, result: CategoryResult) -> None:
     path = result.incident.path
     confidence = result.incident.confidence
     stage = "Stage 2 (ambiguous)" if result.stage2 else "Stage 1 (unambiguous)"
