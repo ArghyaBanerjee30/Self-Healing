@@ -23,6 +23,19 @@ from agents.code.observer import ObserverResult
 load_dotenv()
 log = logging.getLogger(__name__)
 
+# Suppress Neo4j deprecation warnings for vector index queries
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
+# Singleton embedder — loaded once, reused across all Detective calls
+_embedder = None
+
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
+        from loader.embedder.code_embedder import CodeEmbedder
+        _embedder = CodeEmbedder()
+    return _embedder
+
 
 # ---------------------------------------------------------------------------
 # Neo4j helpers
@@ -323,10 +336,9 @@ def run(signal: Signal, observer: ObserverResult) -> DetectiveResult:
 
     source_code = _read_source(observer.file_path)
 
-    # --- Embed the source code for vector queries ---
+    # --- Embed the source code for vector queries (singleton — loads once) ---
     try:
-        from loader.embedder.code_embedder import CodeEmbedder
-        embedding = CodeEmbedder().embed(source_code)
+        embedding = _get_embedder().embed(source_code)
         has_embedding = True
     except Exception as e:
         log.warning("[Detective] embedding failed: %s — skipping vector queries", e)

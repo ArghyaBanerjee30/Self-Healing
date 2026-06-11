@@ -187,11 +187,13 @@ def _stub_detective(todo: str, s: Signal, ctx: str) -> str:
         return f"[Detective] cannot proceed — Observer found no app file"
 
     result = _detective_agent.run(s, obs)
+    blast = [c["name"] for c in result.blast_radius] or ["none via AST"]
+    similar = [f"{f['name']} ({f['file']}, score={f['score']})" for f in result.similar_functions[:3]]
     summary = (
         f"[Detective] file={result.file_path}:{result.line}  "
         f"function={result.function_name}\n"
-        f"  callers: {result.callers or ['none in KG']}\n"
-        f"  tests: {result.related_tests or ['none found']}\n"
+        f"  blast_radius: {blast}\n"
+        f"  similar_functions: {similar or ['none found']}\n"
         f"  root_cause: {result.root_cause}\n"
         f"  pattern: {result.pattern}"
     )
